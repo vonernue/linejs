@@ -340,7 +340,6 @@ export class LineObs {
 			);
 		const tempId = "reqid-" + crypto.randomUUID();
 		const encryptedArrayBuffer = encryptedData.buffer.slice(encryptedData.byteOffset, encryptedData.byteOffset + encryptedData.byteLength);
-		// @ts-expect-error: will fix cuz typescript version change
 		const edata = new Blob([new Uint8Array(encryptedArrayBuffer as ArrayBuffer)]);
 		const { objId } = await this.uploadObjectForService({
 			data: edata,
@@ -427,7 +426,6 @@ export class LineObs {
 		);
 		const decryptedArrayBuffer = decryptedBuffer.buffer.slice(decryptedBuffer.byteOffset, decryptedBuffer.byteOffset + decryptedBuffer.byteLength);
 		const fileData = new File([
-			// @ts-expect-error: will fix cuz typescript version change
 			new Uint8Array(decryptedArrayBuffer as ArrayBuffer),
 		], fileName);
 		return fileData;
