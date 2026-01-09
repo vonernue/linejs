@@ -169,6 +169,7 @@ export class LineObs {
 			);
 		}
 		const ext = MimeType[data.type as keyof typeof MimeType];
+		const reqseqValue = await this.client.getReqseq("talk");
 		const param: {
 			oid: string;
 			reqseq?: string;
@@ -218,6 +219,7 @@ export class LineObs {
 	}): Promise<
 		{ objId: string; objHash: string; headers: Headers }
 	> {
+		this.client.log("Obs.uploadObjectForService", options);
 		let {
 			data,
 			oType,
@@ -263,6 +265,12 @@ export class LineObs {
 
 		const objId = response.headers.get("x-obs-oid") ?? "";
 		const objHash = response.headers.get("x-obs-hash") ?? "";
+		this.client.log("Obs.uploadObjectForServiceResponse", {
+			objId,
+			objHash,
+			headers: response.headers.toString(),
+		});
+
 		return { objId, objHash, headers: response.headers };
 	}
 
@@ -314,7 +322,7 @@ export class LineObs {
 		};
 
 		const ext = (filename && filename.split(".").at(-1)) ||
-			MimeType[data.type as keyof typeof MimeType];
+			MimeType[data.type];
 
 		const serviceName = "talk";
 		const [obsNamespace, contentType] = typeSet[oType];
@@ -332,6 +340,7 @@ export class LineObs {
 			);
 		const tempId = "reqid-" + crypto.randomUUID();
 		const encryptedArrayBuffer = encryptedData.buffer.slice(encryptedData.byteOffset, encryptedData.byteOffset + encryptedData.byteLength);
+		// @ts-expect-error: will fix cuz typescript version change
 		const edata = new Blob([new Uint8Array(encryptedArrayBuffer as ArrayBuffer)]);
 		const { objId } = await this.uploadObjectForService({
 			data: edata,
@@ -344,19 +353,23 @@ export class LineObs {
 				.uploadObjectForService({
 					data: edata,
 					oType: "file",
-					obsPath: `${serviceName}/${obsNamespace}/${tempId}__ud-preview`,
+					obsPath: `${serviceName}/${obsNamespace}/${objId}__ud-preview`,
 					params,
 				});
 			if (objId !== objId2) {
-				throw new InternalError("ObsError", "objId not match", {
-					headers,
-				});
+				throw new InternalError(
+					"ObsError",
+					"objId not match: " + JSON.stringify(Object.fromEntries(headers)),
+					{
+						headers: Object.fromEntries(headers),
+					},
+				);
 			}
 		}
 
 		const chunks = await this.client.e2ee.encryptE2EEMessage(
 			to,
-			{ keyMaterial, fileName: filename || "linejs." + ext },
+			{ keyMaterial, fileName: filename || "line." + ext },
 			contentType,
 		);
 
@@ -414,6 +427,7 @@ export class LineObs {
 		);
 		const decryptedArrayBuffer = decryptedBuffer.buffer.slice(decryptedBuffer.byteOffset, decryptedBuffer.byteOffset + decryptedBuffer.byteLength);
 		const fileData = new File([
+			// @ts-expect-error: will fix cuz typescript version change
 			new Uint8Array(decryptedArrayBuffer as ArrayBuffer),
 		], fileName);
 		return fileData;
