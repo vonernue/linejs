@@ -1183,13 +1183,16 @@ export class E2EE {
 			data.byteOffset,
 			data.byteOffset + data.byteLength,
 		);
+		const nonceArrayBuffer = nonce.buffer.slice(
+			nonce.byteOffset,
+			nonce.byteOffset + nonce.byteLength,
+		);
 
 		return Buffer.from(
 			await globalThis.crypto.subtle.encrypt(
 				{
 					name: "AES-CTR",
-					// @ts-expect-error: will fix cuz typescript version change
-					counter: nonce,
+					counter: new Uint8Array(nonceArrayBuffer as ArrayBuffer),
 					length: 32,
 				},
 				await globalThis.crypto.subtle.importKey(

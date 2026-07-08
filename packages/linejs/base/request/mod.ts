@@ -153,12 +153,15 @@ export class RequestClient {
 			body: Trequest,
 		});
 
+		const requestArrayBuffer = Trequest.buffer.slice(
+			Trequest.byteOffset,
+			Trequest.byteOffset + Trequest.byteLength,
+		);
 		const request = new Request(`https://${this.endpoint}${path}`, {
 			method: overrideMethod,
 			headers,
 			signal: AbortSignal.timeout(timeout),
-			// @ts-expect-error: will fix cuz typescript version change
-			body: Trequest,
+			body: new Uint8Array(requestArrayBuffer as ArrayBuffer),
 		});
 		const response = this.shouldUseLegyEncryptedRequest(path, headers)
 			? await this.legyTransport.fetch(request, this.client.fetch, {

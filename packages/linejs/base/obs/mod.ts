@@ -243,7 +243,7 @@ export class LineObs {
 		};
 
 		params = { ...baseParams, ...(params || {}) };
-		
+
 		if (!data || data.size === 0) {
 			throw new InternalError("ObsError", "No data to send.");
 		}
@@ -341,8 +341,13 @@ export class LineObs {
 				Buffer.from(await data.arrayBuffer()),
 			);
 		const tempId = "reqid-" + crypto.randomUUID();
-		// @ts-expect-error: will fix cuz typescript version change
-		const edata = new Blob([encryptedData]);
+		const encryptedArrayBuffer = encryptedData.buffer.slice(
+			encryptedData.byteOffset,
+			encryptedData.byteOffset + encryptedData.byteLength,
+		);
+		const edata = new Blob([
+			new Uint8Array(encryptedArrayBuffer as ArrayBuffer),
+		]);
 		const { objId } = await this.uploadObjectForService({
 			data: edata,
 			oType: "file",
@@ -433,12 +438,16 @@ export class LineObs {
 			obsPath: "talk/" + contentMetadata.SID,
 			addHeaders: { "X-Talk-Meta": talkMeta },
 		});
+		const decryptedBuffer = await this.client.e2ee.decryptByKeyMaterial(
+			Buffer.from(await data.arrayBuffer()),
+			keyMaterial,
+		);
+		const decryptedArrayBuffer = decryptedBuffer.buffer.slice(
+			decryptedBuffer.byteOffset,
+			decryptedBuffer.byteOffset + decryptedBuffer.byteLength,
+		);
 		const fileData = new File([
-			// @ts-expect-error: will fix cuz typescript version change
-			await this.client.e2ee.decryptByKeyMaterial(
-				Buffer.from(await data.arrayBuffer()),
-				keyMaterial,
-			),
+			new Uint8Array(decryptedArrayBuffer as ArrayBuffer),
 		], fileName);
 		return fileData;
 	}

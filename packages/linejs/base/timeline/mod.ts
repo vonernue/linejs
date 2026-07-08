@@ -226,6 +226,31 @@ export class Timeline {
 		).then((r) => r.json());
 	}
 
+	public async listComment(options: {
+		homeId: string;
+		contentId: string;
+		scrollId?: string;
+	}): Promise<TimelineResponse> {
+		await this.initTimeline();
+		const { homeId, contentId, scrollId } = { ...options };
+		const headers = {
+			...this.timelineHeaders,
+			"x-lhm": "GET",
+		};
+		const params = new URLSearchParams({
+			homeId,
+			contentId,
+			...(scrollId ? { scrollId } : {}),
+		});
+
+		return await this.client.fetch(
+			`https://${this.client.request.endpoint}/${
+				homeId[0] == "s" ? "sn" : "mh"
+			}/api/v57/comment/getList.json?${params}`,
+			{ headers },
+		).then((r) => r.json());
+	}
+
 	public async listPost(options: {
 		homeId: string;
 		postId?: string;
@@ -261,7 +286,7 @@ export class Timeline {
 			{ headers },
 		).then((r) => r.json());
 	}
-	
+
 	public async updatePost(options: {
 		homeId: string;
 		postId: string;
@@ -363,13 +388,17 @@ export class Timeline {
 		const contents: LooseType = {
 			sticonMetas: [],
 			contentsStyle: {
-				textStyle: textSizeMode || textAnimation ? {
-					textSizeMode: textSizeMode,
-					textAnimation: textAnimation,
-				} : {},
-				stickerStyle: backgroundColor ? {
-					backgroundColor: backgroundColor,
-				} : {},
+				textStyle: textSizeMode || textAnimation
+					? {
+						textSizeMode: textSizeMode,
+						textAnimation: textAnimation,
+					}
+					: {},
+				stickerStyle: backgroundColor
+					? {
+						backgroundColor: backgroundColor,
+					}
+					: {},
 				mediaStyle: {},
 			},
 			stickers: stickers,
@@ -470,7 +499,7 @@ export class Timeline {
 			},
 		).then((r) => r.json());
 	}
-	
+
 	public async sharePost(options: {
 		postId: string;
 		chatMid: string;
