@@ -4,6 +4,22 @@ import { BaseClient } from "../core/mod.ts";
 
 const fixtureToken = [btoa('{"alg":"none"}'), btoa('{"sub":"fixture"}'), "fixture"].join(".");
 
+test("empty successful Thrift responses return null", async () => {
+	const client = new BaseClient({
+		device: "DESKTOPWIN",
+		fetch: async () => new Response(null, { status: 204 }),
+	});
+	assert.strictEqual(await client.request.request([], "noop"), null);
+});
+
+test("empty HTTP errors are not treated as successful Thrift responses", async () => {
+	const client = new BaseClient({
+		device: "DESKTOPWIN",
+		fetch: async () => new Response(null, { status: 503 }),
+	});
+	await rejects(client.request.request([], "noop"), /status=503/);
+});
+
 for (const path of ["/S4", "/SYNC4"]) {
 	test(`default Talk transport sends ${path} over HTTPS and rejects redirects`, async () => {
 		const requests: Request[] = [];

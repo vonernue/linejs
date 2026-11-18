@@ -90,7 +90,7 @@ export class RequestClient {
 			undefined,
 			timeout,
 		);
-		return res.data.success;
+		return res === null ? (null as T) : res.data.success;
 	}
 
 	/**
@@ -105,7 +105,7 @@ export class RequestClient {
 	 * @param {boolean | string} [parse=true] - Whether to parse the response.
 	 * @param {boolean} [isReRequest=false] - Is Re-Request.
 	 * @param {number} [timeout=this.timeOutMs] - The timeout milliseconds of the request.
-	 * @returns {Promise<ParsedThrift>} The response.
+	 * @returns The Thrift response, or null for a successful empty response.
 	 * @throws {InternalError} If the request fails or timeout.
 	 */
 	private async requestCore(
@@ -118,7 +118,7 @@ export class RequestClient {
 		parse: boolean | string = true,
 		isReRequest: boolean = false,
 		timeout: number = this.client.config.timeout,
-	): Promise<ParsedThrift> {
+	): Promise<ParsedThrift | null> {
 		const protocol = Protocols[protocolType];
 
 		const headers = {
@@ -174,6 +174,9 @@ export class RequestClient {
 			parsedBody,
 			methodName,
 		});
+		if (response.ok && parsedBody.length === 0) {
+			return null;
+		}
 		let res: ParsedThrift;
 		let hasError = false;
 		try {
