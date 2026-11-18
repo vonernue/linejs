@@ -23,11 +23,11 @@ export interface NativeGroupOpusPacketizeOptions {
 	 * PLANET 1:1 examples usually pass packets shaped as `00 + opus`.
 	 */
 	inputPrefixBytes?: number;
+	/** Per-frame non-silence activity (including unvoiced audio). Required for CELT. */
+	frameActivity?: readonly boolean[];
 }
 
-export function streamSource(
-	stream: ReadableStream<PcmFrame>,
-): AudioSource {
+export function streamSource(stream: ReadableStream<PcmFrame>): AudioSource {
 	return {
 		async *frames(opts) {
 			const reader = stream.getReader();
@@ -58,8 +58,7 @@ export function bufferSource(opts: {
 }): AudioSource {
 	const channels = opts.channels ?? 1;
 	const frameMs = opts.frameDurationMs ?? 20;
-	const frameSamples = Math.floor((opts.sampleRate * frameMs) / 1000) *
-		channels;
+	const frameSamples = Math.floor((opts.sampleRate * frameMs) / 1000) * channels;
 	return {
 		async *frames(o) {
 			for (let i = 0; i < opts.samples.length; i += frameSamples) {
@@ -106,9 +105,7 @@ export function bufferSink(): AudioSink & { frames: PcmFrame[] } {
 	};
 }
 
-export function streamSink(
-	stream: WritableStream<PcmFrame>,
-): AudioSink {
+export function streamSink(stream: WritableStream<PcmFrame>): AudioSink {
 	const writer = stream.getWriter();
 	return {
 		write(f) {
@@ -121,6 +118,11 @@ export function streamSink(
 	};
 }
 
+/**
+ * Combine matching mono 20 ms code-0 Opus frames into 40 ms LINE group EAS2
+ * payloads, not standard Opus packets. CELT needs explicit non-silence activity;
+ * SILK/hybrid carry their own activity. Unsupported layouts throw.
+ */
 export function packetizeNativeGroupOpusPairs(
 	packets: Uint8Array[],
 	opts: NativeGroupOpusPacketizeOptions = {},
@@ -129,28 +131,57 @@ export function packetizeNativeGroupOpusPairs(
 	if (!Number.isInteger(inputPrefixBytes) || inputPrefixBytes < 0) {
 		throw new Error("packetizeNativeGroupOpusPairs: invalid inputPrefixBytes");
 	}
+	if (packets.length % 2) {
+		throw new Error("packetizeNativeGroupOpusPairs: complete pairs required");
+	}
+	const activity = opts.frameActivity;
+	if (
+		activity !== undefined &&
+		(activity.length !== packets.length ||
+			Array.from(activity).some((value) => typeof value !== "boolean"))
+	) {
+		throw new Error("packetizeNativeGroupOpusPairs: invalid frameActivity");
+	}
 	const out: Uint8Array[] = [];
-	for (let i = 0; i + 1 < packets.length; i += 2) {
+	for (let i = 0; i < packets.length; i += 2) {
 		const left = packets[i];
 		const right = packets[i + 1];
-		if (
-			left.length <= inputPrefixBytes || right.length <= inputPrefixBytes
-		) continue;
+		for (const packet of [left, right]) {
+			if (packet.length <= inputPrefixBytes + 1 || packet.length > inputPrefixBytes + 1276) {
+				throw new Error("packetizeNativeGroupOpusPairs: invalid Opus frame size");
+			}
+			if (packet[inputPrefixBytes] & 3) {
+				throw new Error("packetizeNativeGroupOpusPairs: single-frame code-0 input required");
+			}
+		}
+		if (left[inputPrefixBytes] !== right[inputPrefixBytes]) {
+			throw new Error("packetizeNativeGroupOpusPairs: matching TOC required");
+		}
+		const config = left[inputPrefixBytes] >>> 3;
+		const is20ms =
+			config >= 16 ? config % 4 === 3 : config >= 12 ? config % 2 === 1 : config % 4 === 1;
+		if (left[inputPrefixBytes] & 4 || !is20ms) {
+			throw new Error("packetizeNativeGroupOpusPairs: mono 20ms frames required");
+		}
+		if (config >= 16 && activity === undefined) {
+			throw new Error("packetizeNativeGroupOpusPairs: CELT frameActivity required");
+		}
 		const nativePrefix = out.length < 2 ? 0x00 : 0x10;
 		const toc = (left[inputPrefixBytes] & 0xfc) | 0x03;
 		const leftFrame = left.subarray(inputPrefixBytes + 1);
 		const rightFrame = right.subarray(inputPrefixBytes + 1);
-		const header = leftFrame.length === rightFrame.length
-			? new Uint8Array([nativePrefix, toc, 0x02])
-			: new Uint8Array([
-				nativePrefix,
-				toc,
-				0x82,
-				...opusFrameSizeBytes(leftFrame.length),
-			]);
-		const packet = new Uint8Array(
-			header.length + leftFrame.length + rightFrame.length,
-		);
+		const vbr = leftFrame.length !== rightFrame.length;
+		// EAS2 CELT SAD: ceil(frameCount / 8) bytes, MSB first, before lengths.
+		// A set bit means non-silence, including unvoiced audio, not speech-only VAD.
+		const sad = config >= 16 ? [(activity![i] ? 0x80 : 0) | (activity![i + 1] ? 0x40 : 0)] : [];
+		const header = new Uint8Array([
+			nativePrefix,
+			toc,
+			vbr ? 0x82 : 0x02,
+			...sad,
+			...(vbr ? opusFrameSizeBytes(leftFrame.length) : []),
+		]);
+		const packet = new Uint8Array(header.length + leftFrame.length + rightFrame.length);
 		packet.set(header, 0);
 		packet.set(leftFrame, header.length);
 		packet.set(rightFrame, header.length + leftFrame.length);
@@ -164,7 +195,8 @@ function opusFrameSizeBytes(size: number): number[] {
 		throw new Error("packetizeNativeGroupOpusPairs: invalid Opus frame size");
 	}
 	if (size < 252) return [size];
-	return [252 + (size & 0x03), size >>> 2];
+	const first = 252 + (size & 0x03);
+	return [first, (size - first) >>> 2];
 }
 
 export interface AudioEncoder {
@@ -183,19 +215,11 @@ export interface CodecFactory {
 		channels: number;
 		bitrate?: number;
 		frameDurationMs?: number;
-		bandwidth?:
-			| "narrowband"
-			| "mediumband"
-			| "wideband"
-			| "superwideband"
-			| "fullband";
+		bandwidth?: "narrowband" | "mediumband" | "wideband" | "superwideband" | "fullband";
 		signal?: "auto" | "voice" | "music";
 		vbr?: boolean;
 	}): AudioEncoder;
-	newDecoder(opts: {
-		sampleRate: number;
-		channels: number;
-	}): AudioDecoder;
+	newDecoder(opts: { sampleRate: number; channels: number }): AudioDecoder;
 }
 
 export const defaultCodecFactory: CodecFactory = {
@@ -214,14 +238,10 @@ export function decodeWavSync(bytes: Uint8Array): {
 	channels: number;
 } {
 	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	if (
-		bytes[0] !== 0x52 || bytes[1] !== 0x49 || bytes[2] !== 0x46 ||
-		bytes[3] !== 0x46
-	) throw new Error("decodeWavSync: not a RIFF file");
-	if (
-		bytes[8] !== 0x57 || bytes[9] !== 0x41 || bytes[10] !== 0x56 ||
-		bytes[11] !== 0x45
-	) throw new Error("decodeWavSync: not a WAVE file");
+	if (bytes[0] !== 0x52 || bytes[1] !== 0x49 || bytes[2] !== 0x46 || bytes[3] !== 0x46)
+		throw new Error("decodeWavSync: not a RIFF file");
+	if (bytes[8] !== 0x57 || bytes[9] !== 0x41 || bytes[10] !== 0x56 || bytes[11] !== 0x45)
+		throw new Error("decodeWavSync: not a WAVE file");
 	let off = 12;
 	let fmt: {
 		channels: number;
@@ -232,12 +252,7 @@ export function decodeWavSync(bytes: Uint8Array): {
 	let dataOff = -1;
 	let dataLen = 0;
 	while (off + 8 <= bytes.length) {
-		const id = String.fromCharCode(
-			bytes[off],
-			bytes[off + 1],
-			bytes[off + 2],
-			bytes[off + 3],
-		);
+		const id = String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
 		const size = dv.getUint32(off + 4, true);
 		const start = off + 8;
 		if (id === "fmt ") {
@@ -263,14 +278,10 @@ export function decodeWavSync(bytes: Uint8Array): {
 	if (!fmt) throw new Error("decodeWavSync: no fmt chunk");
 	if (dataOff < 0) throw new Error("decodeWavSync: no data chunk");
 	if (fmt.audioFormat !== 1) {
-		throw new Error(
-			`decodeWavSync: audioFormat=${fmt.audioFormat} not PCM; use a real decoder`,
-		);
+		throw new Error(`decodeWavSync: audioFormat=${fmt.audioFormat} not PCM; use a real decoder`);
 	}
 	if (fmt.bitsPerSample !== 16) {
-		throw new Error(
-			`decodeWavSync: ${fmt.bitsPerSample}-bit samples not supported (need 16)`,
-		);
+		throw new Error(`decodeWavSync: ${fmt.bitsPerSample}-bit samples not supported (need 16)`);
 	}
 	const sampleCount = Math.floor(dataLen / 2);
 	const samples = new Int16Array(sampleCount);

@@ -1,10 +1,9 @@
 // For Relation (find user, etc)
 
 import { LINEStruct, type ProtocolKey } from "../../thrift/mod.ts";
-import type * as LINETypes from "@evex/linejs-types";
+import type * as LINETypes from "@evex-dev/linejs-types";
 import type { BaseClient } from "../../core/mod.ts";
 import type { BaseService } from "../types.ts";
-import type { LooseType } from "@evex/loose-types";
 
 export class RelationService implements BaseService {
 	client: BaseClient;
@@ -50,9 +49,10 @@ export class RelationService implements BaseService {
 		);
 	}
 
-	async getContactsV3(
-		options: { mids: string[]; checkUserStatusStrictly?: boolean },
-	): Promise<LINETypes.getContactsV3_result["success"]> {
+	async getContactsV3(options: {
+		mids: string[];
+		checkUserStatusStrictly?: boolean;
+	}): Promise<LINETypes.getContactsV3_result["success"]> {
 		return await this.client.request.request(
 			LINEStruct.getContactsV3_args({
 				request: {
@@ -102,31 +102,33 @@ export class RelationService implements BaseService {
 		reference?: string;
 		trackingMetaType?: number;
 		trackingMetaHint?: string;
-	}): Promise<LooseType> {
+	}): Promise<LINETypes.addFriendByMid_result["success"]> {
 		const { mid, reference, trackingMetaType, trackingMetaHint } = {
 			trackingMetaType: 5,
 			...options,
 		};
 		return await this.client.request.request(
 			[
-				[8, 1, await this.client.getReqseq()], // seq
-				[11, 2, mid],
 				[
 					12,
-					3,
+					1,
 					[
-						[11, 1, reference],
-						[12, 3, [[12, trackingMetaType, [[
-							11,
-							1,
-							trackingMetaHint,
-						]]]]],
+						[8, 1, await this.client.getReqseq()], // seq
+						[11, 2, mid],
+						[
+							12,
+							3,
+							[
+								[11, 1, reference],
+								[12, 2, [[12, trackingMetaType, [[11, 1, trackingMetaHint]]]]],
+							],
+						],
 					],
 				],
 			],
 			"addFriendByMid",
 			this.protocolType,
-			false,
+			true,
 			this.requestPath,
 		);
 	}
@@ -155,14 +157,14 @@ export class RelationService implements BaseService {
 	 */
 	public async addFriendByUserId(options: {
 		userId: string;
-	}): Promise<LooseType> {
+	}): Promise<LINETypes.addFriendByMid_result["success"]> {
 		const contact = await this.findContactBySearchIdOrTicketV3({
 			searchId: options.userId,
 		});
 		return await this.addFriendByMid({
 			mid: contact.mid,
 			reference: '{"screen":"friendAdd:idSearch","spec":"native"}',
-			trackingMetaType: 2,
+			trackingMetaType: 3,
 			trackingMetaHint: options.userId,
 		});
 	}
@@ -171,9 +173,7 @@ export class RelationService implements BaseService {
 	 * @description Find a contact by phone number. The number is in E.164 form,
 	 * e.g. `+66814298575`. Throws when nothing matches or the lookup is rate limited.
 	 */
-	public async findContactByPhoneV3(options: {
-		phone: string;
-	}): Promise<LINETypes.Contact> {
+	public async findContactByPhoneV3(options: { phone: string }): Promise<LINETypes.Contact> {
 		return await this.client.request.request(
 			[[12, 1, [[11, 1, options.phone]]]],
 			"findContactByPhoneV3",
@@ -188,7 +188,7 @@ export class RelationService implements BaseService {
 	 */
 	public async addFriendByPhone(options: {
 		phone: string;
-	}): Promise<LooseType> {
+	}): Promise<LINETypes.addFriendByMid_result["success"]> {
 		const contact = await this.findContactByPhoneV3({ phone: options.phone });
 		return await this.addFriendByMid({
 			mid: contact.mid,

@@ -1,8 +1,4 @@
-import {
-	type Device,
-	type DeviceDetails,
-	getDeviceDetails,
-} from "./utils/devices.ts";
+import { type Device, type DeviceDetails, getDeviceDetails } from "./utils/devices.ts";
 
 import { type BaseStorage, MemoryStorage } from "../storage/mod.ts";
 
@@ -20,6 +16,7 @@ import {
 	CallService,
 	ChannelService,
 	LiffService,
+	MoaService,
 	RelationService,
 	SquareLiveTalkService,
 	SquareService,
@@ -31,16 +28,17 @@ import { Thrift } from "../thrift/mod.ts";
 import { RequestClient } from "../request/mod.ts";
 import type { AuthTokenInput } from "../request/auth_token.ts";
 import { E2EE } from "../e2ee/mod.ts";
+import { createNodeFetch } from "./node_fetch.ts";
 import { LineObs } from "../obs/mod.ts";
 import { Timeline } from "../timeline/mod.ts";
 import { Polling } from "../polling/mod.ts";
 import { ConnManager } from "../push/mod.ts";
 
-import { Thrift as def } from "@evex/linejs-types/thrift";
+import { Thrift as def } from "@evex-dev/linejs-types/thrift";
 
-import type * as LINETypes from "@evex/linejs-types";
+import type * as LINETypes from "@evex-dev/linejs-types";
 import type { Fetch, FetchLike } from "../types.ts";
-import type { LooseType } from "@evex/loose-types";
+import type { LooseType } from "../types.ts";
 
 export interface LoginOption {
 	email?: string;
@@ -92,12 +90,14 @@ export interface ClientInit {
 	legy?: {
 		encrypted?: boolean | "auto";
 		endpoint?: string;
+		/** Retry empty LEGY gateway 404s using other DNS addresses. */
+		gatewayFailover?: boolean;
 	};
 }
 
 export interface Config {
 	/**
-	 * Timeout
+	 * Request timeout, also used for Node TCP/TLS connection establishment.
 	 * @default 30_000
 	 */
 	timeout: number;
@@ -129,11 +129,14 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 	readonly call: CallService;
 	readonly channel: ChannelService;
 	readonly liff: LiffService;
+	readonly moa: MoaService;
 	readonly relation: RelationService;
 	readonly livetalk: SquareLiveTalkService;
 	readonly square: SquareService;
 	readonly talk: TalkService;
 	#customFetch?: FetchLike;
+	#nodeFetch = createNodeFetch(false);
+	#nodePushFetch = createNodeFetch(true);
 	disabled?: boolean;
 	profile?: LINETypes.Profile;
 	config: Config;
@@ -142,6 +145,7 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 	readonly legy: {
 		encrypted: boolean | "auto";
 		endpoint?: string;
+		gatewayFailover: boolean;
 	};
 	/**
 	 * Initializes a new instance of the class.
@@ -185,6 +189,7 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		this.legy = {
 			encrypted: init.legy?.encrypted ?? "auto",
 			endpoint: init.legy?.endpoint,
+			gatewayFailover: init.legy?.gatewayFailover ?? false,
 		};
 
 		this.storage = init.storage ?? new MemoryStorage();
@@ -203,6 +208,7 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		this.channel = new ChannelService(this);
 		this.liff = new LiffService(this);
 		this.livetalk = new SquareLiveTalkService(this);
+		this.moa = new MoaService(this);
 		this.relation = new RelationService(this);
 		this.square = new SquareService(this);
 		this.talk = new TalkService(this);
@@ -225,19 +231,30 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		return typeMapping[mid[0]] ?? null;
 	}
 	reqseqs?: Record<string, number>;
+	#reqseqQueue: Promise<void> = Promise.resolve();
 	async getReqseq(name: string = "talk"): Promise<number> {
-		if (!this.reqseqs) {
-			this.reqseqs = JSON.parse(
-				((await this.storage.get("reqseq")) ?? "{}").toString(),
-			) as Record<string, number>;
-		}
-		if (!this.reqseqs[name]) {
-			this.reqseqs[name] = 0;
-		}
-		const seq = this.reqseqs[name];
-		this.reqseqs[name]++;
-		await this.storage.set("reqseq", JSON.stringify(this.reqseqs));
-		return seq;
+		// Serialize initialization and persistence, including the first parallel
+		// requests. Otherwise each storage read can reset the counter to zero.
+		const next = this.#reqseqQueue.then(async () => {
+			if (!this.reqseqs) {
+				this.reqseqs = JSON.parse(
+					((await this.storage.get("reqseq")) ?? "{}").toString(),
+				) as Record<string, number>;
+			}
+			if (!this.reqseqs[name]) {
+				this.reqseqs[name] = 0;
+			}
+			const seq = this.reqseqs[name];
+			this.reqseqs[name]++;
+			await this.storage.set("reqseq", JSON.stringify(this.reqseqs));
+			return seq;
+		});
+		// A failed storage operation must not poison subsequent allocations.
+		this.#reqseqQueue = next.then(
+			() => {},
+			() => {},
+		);
+		return await next;
 	}
 
 	// NOTE: use allow function.
@@ -247,11 +264,17 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		init?: RequestInit,
 	): Promise<Response> => {
 		const req = new Request(info, init);
-		const res =
-			await (this.#customFetch
-				? this.#customFetch(req)
-				: globalThis.fetch(req));
+		const fetchFn =
+			this.#customFetch ?? (await this.#nodeFetch(this.config.timeout)) ?? globalThis.fetch;
+		const res = await fetchFn(req);
 		return res;
+	};
+
+	/** Node PUSH requires HTTP/2. Explicit custom transports retain control. */
+	readonly fetchPush: Fetch = async (info, init) => {
+		if (this.#customFetch) return this.fetch(info, init);
+		const fetchFn = (await this.#nodePushFetch(this.config.timeout)) ?? this.fetch;
+		return fetchFn(info, init);
 	};
 
 	/**
@@ -287,17 +310,14 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 				return v.map((item) => BaseClient.jsonReplacer("", item));
 			}
 			if (v instanceof Uint8Array) {
-				return `Uint8Array[${v.length}]<${
-					Array.from(v).map((e) => e.toString(16).padStart(2, "0")).join(" ")
-				}>`;
+				return `Uint8Array[${v.length}]<${Array.from(v)
+					.map((e) => e.toString(16).padStart(2, "0"))
+					.join(" ")}>`;
 			}
 			if (v.type === "Buffer" && Array.isArray(v.data)) {
-				return `Buffer[${v.data.length}]<${
-					Array.from(v.data).map((e) => Number(e).toString(16).padStart(2, "0"))
-						.join(
-							" ",
-						)
-				}>`;
+				return `Buffer[${v.data.length}]<${Array.from(v.data)
+					.map((e) => Number(e).toString(16).padStart(2, "0"))
+					.join(" ")}>`;
 			}
 			if (v instanceof Blob) {
 				return `Blob[${v.size}]@${v.type}`;
@@ -311,9 +331,7 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 					const midType = key.match(/(.)[0123456789abcdef]{32}/);
 					if (midType && midType[1]) {
 						midCount++;
-						newObj[
-							`[${midType[1].toUpperCase()} mid ${midCount}]`
-						] = value;
+						newObj[`[${midType[1].toUpperCase()} mid ${midCount}]`] = value;
 					} else {
 						newObj[key] = value;
 					}

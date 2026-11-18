@@ -1,5 +1,5 @@
 import type { BaseClient } from "../core/mod.ts";
-import type { Operation, SquareEvent } from "@evex/linejs-types";
+import type { Operation, SquareEvent } from "@evex-dev/linejs-types";
 
 export interface SyncData {
 	square?: string;
@@ -38,11 +38,13 @@ export class Polling {
 	 *
 	 * @deprecated
 	 */
-	async *_listenSquareEvents(options: {
-		signal?: AbortSignal;
-		onError?: (error: unknown) => void;
-		pollingInterval?: number;
-	} = {}): AsyncGenerator<SquareEvent, void, unknown> {
+	async *_listenSquareEvents(
+		options: {
+			signal?: AbortSignal;
+			onError?: (error: unknown) => void;
+			pollingInterval?: number;
+		} = {},
+	): AsyncGenerator<SquareEvent, void, unknown> {
 		const { signal, onError, pollingInterval } = {
 			pollingInterval: 1000,
 			...options,
@@ -86,11 +88,13 @@ export class Polling {
 	 *
 	 * @deprecated
 	 */
-	async *_listenTalkEvents(options: {
-		signal?: AbortSignal;
-		onError?: (error: unknown) => void;
-		pollingInterval?: number;
-	} = {}): AsyncGenerator<Operation, void, unknown> {
+	async *_listenTalkEvents(
+		options: {
+			signal?: AbortSignal;
+			onError?: (error: unknown) => void;
+			pollingInterval?: number;
+		} = {},
+	): AsyncGenerator<Operation, void, unknown> {
 		const { signal, onError, pollingInterval } = {
 			pollingInterval: 100,
 			...options,
@@ -101,10 +105,7 @@ export class Polling {
 					...this.sync.talk,
 					limit: 100,
 				});
-				if (
-					response.fullSyncResponse &&
-					response.fullSyncResponse.nextRevision
-				) {
+				if (response.fullSyncResponse && response.fullSyncResponse.nextRevision) {
 					this.sync.talk.revision = response.fullSyncResponse.nextRevision;
 				}
 				if (
@@ -112,27 +113,24 @@ export class Polling {
 					response.operationResponse.globalEvents &&
 					response.operationResponse.globalEvents.lastRevision
 				) {
-					this.sync.talk.globalRev =
-						response.operationResponse.globalEvents.lastRevision;
+					this.sync.talk.globalRev = response.operationResponse.globalEvents.lastRevision;
 				}
 				if (
 					response.operationResponse &&
 					response.operationResponse.individualEvents &&
 					response.operationResponse.individualEvents.lastRevision
 				) {
-					this.sync.talk.individualRev =
-						response.operationResponse.individualEvents
-							.lastRevision;
+					this.sync.talk.individualRev = response.operationResponse.individualEvents.lastRevision;
 				}
-				if (
-					!(response.operationResponse &&
-						response.operationResponse.operations)
-				) {
-					continue;
-				}
-				for (const event of response.operationResponse.operations) {
-					this.sync.talk.revision = event.revision;
-					yield event;
+				// Only iterate operations when present; falling through to the
+				// shared sleep/abort tail is required — an early `continue` here
+				// used to busy-loop without delay and made the AbortSignal
+				// unobservable.
+				if (response.operationResponse && response.operationResponse.operations) {
+					for (const event of response.operationResponse.operations) {
+						this.sync.talk.revision = event.revision;
+						yield event;
+					}
 				}
 			} catch (error) {
 				if (onError) {
@@ -151,35 +149,64 @@ export class Polling {
 			cb && cb();
 			return;
 		}
-		while (this.client.authToken) {
-			this.islisten = true;
-			try {
-				await this.client.push.initializeConn(1, this.listenTarget);
-			} catch (error) {
-				this.client.log("LegyPusherError_cannot_init", { error });
-				throw error;
+		try {
+			while (this.client.authToken) {
+				this.islisten = true;
+				try {
+					await this.client.push.initializeConn(1, this.listenTarget);
+				} catch (error) {
+					this.#reportFailure("LegyPusherError_cannot_init", error);
+					throw error;
+				}
+				try {
+					cb && cb();
+					await this.client.push.InitAndRead(this.listenTarget);
+					await sleep(4000);
+				} catch (error) {
+					this.#reportFailure("LegyPusherError", error);
+					await sleep(4000);
+				}
 			}
-			try {
-				cb && cb();
-				await this.client.push.InitAndRead(this.listenTarget);
-				await sleep(4000);
-			} catch (error) {
-				this.client.log("LegyPusherError", { error });
-				await sleep(4000);
-			}
+		} finally {
+			this.islisten = false;
 		}
-		this.islisten = false;
+	}
+
+	#reportFailure(type: string, error: unknown): void {
+		try {
+			this.client.log(type, { error });
+		} catch {
+			// A synchronous log listener must not replace the original error.
+		}
+	}
+
+	// The pusher loop outlives the call that starts it and nobody awaits it, so
+	// its rejection — `initializeConn` failing on the first connect rethrows
+	// one — used to surface as an unhandled rejection and take the host process
+	// down. Terminate both shared streams with the original error so pending
+	// readers can observe failure, then report it. A new listen call may retry.
+	#startLegyPusher(): void {
+		this.initLegyPusher().catch((error) => {
+			for (const stream of [this.client.push.opStream, this.client.push.sqStream]) {
+				try {
+					stream.error(error);
+				} catch {
+					// Failure to terminate one stream must not strand the other.
+				}
+			}
+			this.#reportFailure("LegyPusherError", error);
+		});
 	}
 
 	listenSquareEvents(): ReadableStream<SquareEvent> {
 		this.client.push.sqStream.renew();
-		this.initLegyPusher();
+		this.#startLegyPusher();
 		return this.client.push.sqStream.stream;
 	}
 
 	listenTalkEvents(): ReadableStream<Operation> {
 		this.client.push.opStream.renew();
-		this.initLegyPusher();
+		this.#startLegyPusher();
 		return this.client.push.opStream.stream;
 	}
 }

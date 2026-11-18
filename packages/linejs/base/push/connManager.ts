@@ -19,11 +19,11 @@ import type {
 	SquareService_fetchMyEvents_result,
 	sync_args,
 	sync_result,
-} from "@evex/linejs-types";
+} from "@evex-dev/linejs-types";
 
 import type { ParsedThrift } from "../thrift/mod.ts";
 import { Buffer } from "node:buffer";
-import type { LooseType } from "@evex/loose-types";
+import type { LooseType } from "../types.ts";
 
 function gen_m(ss = [1, 3, 5, 6, 8, 9, 10]) {
 	let i = 0;
@@ -42,6 +42,7 @@ export class ConnManager {
 	client: BaseClient;
 	conns: Conn[] = [];
 	currPingId = 0;
+	private heartbeatInFlight = false;
 	subscriptionIds: Record<number, number> = {};
 	signOnRequests: Record<number, LooseType[]> = {};
 	onPingCallback: (id: number) => void;
@@ -73,25 +74,28 @@ export class ConnManager {
 		let controller: ReadableStreamDefaultController<T> | null = null;
 
 		const chunks: T[] = [];
-		const stream = new ReadableStream<T>({
-			start(c) {
-				controller = c;
+		const stream = new ReadableStream<T>(
+			{
+				start(c) {
+					controller = c;
+				},
+				pull(c) {
+					if (chunks.length) {
+						c.enqueue(chunks.shift()!);
+					}
+				},
+				cancel() {
+					controller = null;
+					writer.renew();
+				},
 			},
-			pull(c) {
-				if (chunks.length) {
-					c.enqueue(chunks.shift()!);
-				}
+			{
+				highWaterMark: 200,
+				size() {
+					return 1;
+				},
 			},
-			cancel() {
-				controller = null;
-				writer.renew();
-			},
-		}, {
-			highWaterMark: 200,
-			size() {
-				return 1;
-			},
-		});
+		);
 
 		const writer = {
 			stream,
@@ -114,48 +118,47 @@ export class ConnManager {
 				this.renew();
 			},
 			renew() {
-				this.stream = new ReadableStream<T>({
-					start(c) {
-						controller = c;
+				this.stream = new ReadableStream<T>(
+					{
+						start(c) {
+							controller = c;
+						},
+						pull(c) {
+							if (chunks.length) {
+								c.enqueue(chunks.shift()!);
+							}
+						},
+						cancel() {
+							controller = null;
+						},
 					},
-					pull(c) {
-						if (chunks.length) {
-							c.enqueue(chunks.shift()!);
-						}
+					{
+						highWaterMark: 200,
+						size() {
+							return 1;
+						},
 					},
-					cancel() {
-						controller = null;
-					},
-				}, {
-					highWaterMark: 200,
-					size() {
-						return 1;
-					},
-				});
+				);
 			},
 		};
 		return writer;
 	}
 
-	async initializeConn(
-		state = 1,
-		initServices = [3, 6, 8, 9, 10],
-	): Promise<Conn> {
+	async initializeConn(state = 1, initServices = [3, 6, 8, 9, 10]): Promise<Conn> {
 		const _conn = new Conn(this);
 		this.signOnRequests = {};
 		if (state === 1) {
 			this.conns[0] = _conn;
 			this.authToken = this.client.authToken!;
 		}
-		const tosendHeaders: Record<string, string> = this.client.request
-			.getHeader();
+		const tosendHeaders: Record<string, string> = this.client.request.getHeader();
 		tosendHeaders["content-type"] = "application/octet-stream";
 		tosendHeaders["accept"] = "application/octet-stream";
 		const m = gen_m(initServices);
 		this.log(`Using \`m=${m}\` on \`/PUSH\``);
 		const host = this.client.request.endpoint;
 		const port = 443;
-		await (_conn.new(host, port, `/PUSH/1/subs?m=${m}`, tosendHeaders));
+		await _conn.new(host, port, `/PUSH/1/subs?m=${m}`, tosendHeaders);
 		return _conn;
 	}
 
@@ -173,7 +176,7 @@ export class ConnManager {
 		conn: Conn,
 		serviceType: number,
 		kwargs: Record<string, LooseType> = {},
-	): Promise<{ payload: Uint8Array<ArrayBuffer>; id: number; }> {
+	): Promise<{ payload: Uint8Array<ArrayBuffer>; id: number }> {
 		this.log("buildAndSendSignOnRequest", { serviceType, kwargs });
 		const cl = this.client;
 		const id = Object.keys(this.signOnRequests).length + 1;
@@ -194,11 +197,7 @@ export class ConnManager {
 			methodName = "fetchMyEvents";
 		} else if ([5, 8].includes(serviceType)) {
 			// @ts-ignore: will fix
-			req = cl.thrift.writeThrift(
-				gen_sync_args(kwargs),
-				"sync",
-				TCompactProtocol,
-			);
+			req = cl.thrift.writeThrift(gen_sync_args(kwargs), "sync", TCompactProtocol);
 			methodName = "sync";
 		}
 		const header = new Uint8Array(2 + 1 + 1 + 2 + req.length);
@@ -209,9 +208,7 @@ export class ConnManager {
 		header[5] = req.length & 0xff;
 		header.set(req, 6);
 		this.signOnRequests[id] = [serviceType, methodName, null];
-		this.log(
-			`[H2][PUSH] send sign-on-request. requestId:${id}, service:${serviceType}`,
-		);
+		this.log(`[H2][PUSH] send sign-on-request. requestId:${id}, service:${serviceType}`);
 		await conn.writeRequest(2, header);
 		return { payload: header, id };
 	}
@@ -250,8 +247,11 @@ export class ConnManager {
 				}
 				// use client's helpers to pick values (mirror Python checkAndGetValue)
 
-				const { subscription: { subscriptionId }, events, syncToken } =
-					resp.success;
+				const {
+					subscription: { subscriptionId },
+					events,
+					syncToken,
+				} = resp.success;
 
 				this.client.log("SquareService_fetchMyEvents_result", {
 					res: resp.success,
@@ -283,9 +283,7 @@ export class ConnManager {
 				this.subscriptionId = subscriptionId;
 
 				if (!this._eventSynced) {
-					this.log(
-						`myEvents start(${subscriptionId}) : syncToken:${syncToken}`,
-					);
+					this.log(`myEvents start(${subscriptionId}) : syncToken:${syncToken}`);
 					this._eventSynced = true;
 				}
 				return;
@@ -297,12 +295,12 @@ export class ConnManager {
 				let detectedMethod = methodName;
 				try {
 					const proto = new TMoreCompactProtocol(Buffer.from(data));
-					parsed = <LooseType>{
+					parsed = {
 						data: proto.res,
 						_info: {
 							fname: detectedMethod,
 						},
-					};
+					} as LooseType;
 					cl.thrift.rename_data(parsed!);
 
 					if (parsed!.data.e) {
@@ -330,12 +328,8 @@ export class ConnManager {
 
 					this.client.log("sync_result", { res });
 
-					if (
-						response.fullSyncResponse &&
-						response.fullSyncResponse.nextRevision
-					) {
-						this.client.poll.sync.talk.revision =
-							response.fullSyncResponse.nextRevision;
+					if (response.fullSyncResponse && response.fullSyncResponse.nextRevision) {
+						this.client.poll.sync.talk.revision = response.fullSyncResponse.nextRevision;
 					}
 					if (
 						response.operationResponse &&
@@ -351,13 +345,9 @@ export class ConnManager {
 						response.operationResponse.individualEvents.lastRevision
 					) {
 						this.client.poll.sync.talk.individualRev =
-							response.operationResponse.individualEvents
-								.lastRevision;
+							response.operationResponse.individualEvents.lastRevision;
 					}
-					if (
-						(response.operationResponse &&
-							response.operationResponse.operations)
-					) {
+					if (response.operationResponse && response.operationResponse.operations) {
 						for (const event of response.operationResponse.operations) {
 							this.client.poll.sync.talk.revision = event.revision;
 							this.opStream.enqueue(event);
@@ -440,29 +430,44 @@ export class ConnManager {
 	async _OnPushResponse(pushFrame: LegyH2PushFrame) {
 		this.log("_OnPushResponse", pushFrame);
 		if (pushFrame.serviceType === 3 && pushFrame.pushPayload) {
-			this.subscriptionId = this.client.thrift.readThriftStruct(
-				pushFrame.pushPayload,
-				TCompactProtocol,
-			)[1];
-			const res = await this.client.square.fetchMyEvents({
-				subscriptionId: this.subscriptionId,
-				syncToken: this.client.poll.sync.square,
-				limit: 100,
-			});
-			const { events, syncToken, subscription } = res;
+			try {
+				this.subscriptionId = this.client.thrift.readThriftStruct(
+					pushFrame.pushPayload,
+					TCompactProtocol,
+				)[1];
+				const res = await this.client.square.fetchMyEvents({
+					subscriptionId: this.subscriptionId,
+					syncToken: this.client.poll.sync.square,
+					limit: 100,
+				});
+				const { events, syncToken, subscription } = res;
 
-			for (const ev of events) {
-				this.sqStream.enqueue(ev);
+				for (const ev of events) {
+					this.sqStream.enqueue(ev);
+				}
+				this.client.poll.sync.square = syncToken;
+				this.client.emit("update:syncdata", this.client.poll.sync);
+
+				this.subscriptionId = Number(subscription.subscriptionId);
+
+				this.log("SQ_fetchMyEvents", {
+					syncToken,
+					subscriptionId: this.subscriptionId,
+				});
+			} catch (error) {
+				// Conn calls this handler without awaiting it, so a failed
+				// fetchMyEvents (e.g. a request timeout) used to surface as an
+				// unhandled rejection and take the host process down. Report it
+				// the way the pusher reports its other errors; the next push
+				// frame for service 3 retries the fetch.
+				try {
+					this.log("fetchMyEvents failed", { error });
+				} catch {
+					// `log` fans out to user-supplied listeners. Letting one
+					// throw here would reject this handler and put back the
+					// unhandled rejection.
+				}
 			}
-			this.client.poll.sync.square = syncToken;
-			this.client.emit("update:syncdata", this.client.poll.sync);
-
-			this.subscriptionId = Number(subscription.subscriptionId);
-
-			this.log("SQ_fetchMyEvents", {
-				syncToken,
-				subscriptionId: this.subscriptionId,
-			});
 		}
 	}
 
@@ -473,24 +478,69 @@ export class ConnManager {
 		for (const k of Object.keys(this.subscriptionIds)) {
 			const id = Number(k);
 			const t2 = this.subscriptionIds[id];
-			if ((t1 - t2) >= 3000) {
+			if (t1 - t2 >= 3000) {
 				this.subscriptionIds[id] = Date.now() / 1000;
 				refreshIds.push(id);
 			}
 		}
 		if (refreshIds.length) {
-			this.log(`?refresh square subscriptionId: ${refreshIds}`);
+			this.logPingActivity(`renew push conn for square subscriptionId: ${refreshIds}`);
+			const conn = this.conns[0];
+			if (conn) {
+				void conn.close().catch((error) => {
+					this.logPingActivity("square subscription reconnect failed", { error });
+				});
+				return;
+			}
 		}
 		if (pingId % 3 === 0) {
-			this.client.talk.noop().then(() => {
-				const oldToken = this.authToken;
-				const newToken = this.client.authToken;
-				if (oldToken !== newToken && newToken) {
-					this.log("renew push conn for new authToken...");
-					this.authToken = newToken;
-					this.conns[0].close();
+			void this.runHeartbeat();
+		}
+	}
+
+	private async runHeartbeat(): Promise<void> {
+		if (this.heartbeatInFlight) return;
+		this.heartbeatInFlight = true;
+		try {
+			const retryDelaysMs = [30_000, 60_000, 120_000, 300_000, 600_000];
+			const maxAttempts = retryDelaysMs.length + 1;
+			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				try {
+					await this.client.talk.noop();
+				} catch (error) {
+					this.logPingActivity("noop failed", { error, attempt, maxAttempts });
+					if (attempt === maxAttempts) {
+						this.logPingActivity("heartbeat noop retries exhausted");
+						return;
+					}
+					await new Promise<void>((resolve) => setTimeout(resolve, retryDelaysMs[attempt - 1]));
+					continue;
 				}
-			});
+				if (attempt > 1) {
+					this.logPingActivity("heartbeat noop recovered", { attempt });
+				}
+				break;
+			}
+
+			const newToken = this.client.authToken;
+			if (this.authToken !== newToken && newToken) {
+				this.logPingActivity("renew push conn for new authToken...");
+				this.authToken = newToken;
+				await this.conns[0]?.close();
+			}
+		} catch (error) {
+			this.logPingActivity("heartbeat failed", { error });
+		} finally {
+			this.heartbeatInFlight = false;
+		}
+	}
+
+	private logPingActivity(message: string, data?: LooseType): void {
+		try {
+			this.log(message, data);
+		} catch {
+			// Ping handlers are fire-and-forget. A user log listener must not
+			// turn a recoverable noop or reconnect failure into a rejection.
 		}
 	}
 
@@ -517,9 +567,7 @@ export class ConnManager {
 						limit: 100,
 					},
 				};
-				this.log(
-					`request fetchMyEvent(${subscriptionId}), syncToken:${syncToken}`,
-				);
+				this.log(`request fetchMyEvent(${subscriptionId}), syncToken:${syncToken}`);
 				// clear tracked subscriptions
 				this.subscriptionIds = {};
 				await this.buildAndSendSignOnRequest(_conn, service, ex_val);
@@ -532,7 +580,7 @@ export class ConnManager {
 						lastIndividualRevision: this.client.poll.sync.talk.individualRev,
 					},
 				};
-				this.log(`request talk fetcher: ${JSON.stringify(ex_val)}`);
+				this.log("request talk fetcher:", ex_val);
 				await this.buildAndSendSignOnRequest(_conn, service, ex_val);
 			} else {
 				// await this.buildAndSendSignOnRequest(_conn, service, {});

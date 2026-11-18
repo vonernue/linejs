@@ -1,9 +1,4 @@
-import {
-	type NestedArray,
-	type ParsedThrift,
-	type ProtocolKey,
-	Protocols,
-} from "../thrift/mod.ts";
+import { type NestedArray, type ParsedThrift, type ProtocolKey, Protocols } from "../thrift/mod.ts";
 import { type BaseClient, InternalError } from "../core/mod.ts";
 import { shouldUseLegyEncryptedAccess } from "./auth_token.ts";
 import { LegyEncryptedTransport } from "./legy.ts";
@@ -52,8 +47,7 @@ export class RequestClient {
 	constructor(client: BaseClient) {
 		const deviceDetails = client.deviceDetails;
 		this.endpoint = client.endpoint ?? "legy.line-apps.com";
-		this.systemType =
-			`${deviceDetails.device}\t${deviceDetails.appVersion}\t${deviceDetails.systemName}\t${deviceDetails.systemVersion}`;
+		this.systemType = `${deviceDetails.device}\t${deviceDetails.appVersion}\t${deviceDetails.systemName}\t${deviceDetails.systemVersion}`;
 		this.userAgent = `Line/${deviceDetails.appVersion}`;
 		this.client = client;
 	}
@@ -138,11 +132,7 @@ export class RequestClient {
 			protocolType,
 		});
 
-		const Trequest = this.client.thrift.writeThrift(
-			value,
-			methodName,
-			protocol,
-		);
+		const Trequest = this.client.thrift.writeThrift(value, methodName, protocol);
 
 		this.client.log("request", {
 			methodName,
@@ -165,10 +155,10 @@ export class RequestClient {
 		});
 		const response = this.shouldUseLegyEncryptedRequest(path, headers)
 			? await this.legyTransport.fetch(request, this.client.fetch, {
-				application: this.systemType,
-				userAgent: this.userAgent,
-				endpoint: this.client.legy.endpoint,
-			})
+					application: this.systemType,
+					userAgent: this.userAgent,
+					endpoint: this.client.legy.endpoint,
+				})
 			: await this.client.fetch(request);
 		const nextToken = response.headers.get("x-line-next-access");
 		if (nextToken) {
@@ -198,19 +188,12 @@ export class RequestClient {
 		if (parse === true) {
 			this.client.thrift.rename_data(res, square.includes(path));
 		} else if (typeof parse === "string") {
-			res.data.success = this.client.thrift.rename_thrift(
-				parse,
-				res.data[0],
-			);
+			res.data.success = this.client.thrift.rename_thrift(parse, res.data[0]);
 			delete res.data[0];
 			if (res.data[1]) {
-				const structName = RequestClient.EXCEPTION_TYPES[path] ||
-					"TalkException";
+				const structName = RequestClient.EXCEPTION_TYPES[path] || "TalkException";
 				if (structName) {
-					res.data.e = this.client.thrift.rename_thrift(
-						structName,
-						res.data[1],
-					);
+					res.data.e = this.client.thrift.rename_thrift(structName, res.data[1]);
 				} else {
 					res.data.e = res.data[1];
 				}
@@ -220,13 +203,9 @@ export class RequestClient {
 			res.data.success = res.data[0];
 			delete res.data[0];
 			if (res.data[1]) {
-				const structName = RequestClient.EXCEPTION_TYPES[path] ||
-					"TalkException";
+				const structName = RequestClient.EXCEPTION_TYPES[path] || "TalkException";
 				if (structName) {
-					res.data.e = this.client.thrift.rename_thrift(
-						structName,
-						res.data[1],
-					);
+					res.data.e = this.client.thrift.rename_thrift(structName, res.data[1]);
 				} else {
 					res.data.e = res.data[1];
 				}
@@ -240,15 +219,14 @@ export class RequestClient {
 
 		const isRefresh = Boolean(
 			res.data.e &&
-				res.data.e.code === "MUST_REFRESH_V3_TOKEN" &&
-				await this.client.storage.get("refreshToken"),
+			res.data.e.code === "MUST_REFRESH_V3_TOKEN" &&
+			(await this.client.storage.get("refreshToken")),
 		);
 
 		if (res.data.e && !isRefresh) {
 			throw new InternalError(
 				"RequestError",
-				`Request internal failed, ${methodName}(${path}) -> ` +
-					JSON.stringify(res.data.e),
+				`Request internal failed, ${methodName}(${path}) -> ` + JSON.stringify(res.data.e),
 				res.data.e,
 			);
 		}
@@ -259,8 +237,7 @@ export class RequestClient {
 			}
 			throw new InternalError(
 				"RequestError",
-				`Request internal failed, ${methodName}(${path}) -> ` +
-					JSON.stringify(res.data),
+				`Request internal failed, ${methodName}(${path}) -> ` + JSON.stringify(res.data),
 				res.data,
 			);
 		}
@@ -286,9 +263,7 @@ export class RequestClient {
 	 * @param {string} [overrideMethod="POST"] The HTTP method to use in the `x-lhm` header.
 	 * @returns {Record<string, string>} An object with the headers as key-value pairs.
 	 */
-	public getHeader(
-		overrideMethod: string = "POST",
-	): Record<string, string> {
+	public getHeader(overrideMethod: string = "POST"): Record<string, string> {
 		const header = {
 			Host: this.endpoint,
 			accept: "application/x-thrift",
@@ -309,27 +284,34 @@ export class RequestClient {
 	}
 
 	private get legyTransport(): LegyEncryptedTransport {
-		return this.#legyTransport ??= new LegyEncryptedTransport(
+		return (this.#legyTransport ??= new LegyEncryptedTransport(
 			this.client.legy.endpoint,
-		);
+			this.client.legy.gatewayFailover,
+		));
 	}
 
-	private shouldUseLegyEncryptedRequest(
-		path: string,
-		headers: Record<string, string>,
-	): boolean {
+	private shouldUseLegyEncryptedRequest(path: string, headers: Record<string, string>): boolean {
 		const mode = this.client.legy.encrypted;
 		if (mode === false) return false;
 		if (!headers["x-line-access"]) return false;
 		if (mode === true) return true;
-		return isLegyTalkPath(path) &&
-			shouldUseLegyEncryptedAccess(headers["x-line-access"]);
+		return isLegyTalkPath(path) && shouldUseLegyEncryptedAccess(headers["x-line-access"]);
 	}
 }
 
 function isLegyTalkPath(path: string): boolean {
-	return path === "/S3" || path === "/S4" || path === "/V4" ||
-		path === "/SYNC3" || path === "/SYNC4" || path === "/P4" ||
-		path === "/P5" || path === "/NP4" || path === "/NP5" ||
-		path === "/C5" || path === "/CA5" || path === "/ECA5";
+	return (
+		path === "/S3" ||
+		path === "/S4" ||
+		path === "/V4" ||
+		path === "/SYNC3" ||
+		path === "/SYNC4" ||
+		path === "/P4" ||
+		path === "/P5" ||
+		path === "/NP4" ||
+		path === "/NP5" ||
+		path === "/C5" ||
+		path === "/CA5" ||
+		path === "/ECA5"
+	);
 }

@@ -1,6 +1,6 @@
 import type { Client } from "../../client.ts";
 import type { Chat } from "./mod.ts";
-import type * as line from "@evex/linejs-types";
+import type * as line from "@evex-dev/linejs-types";
 import { TalkMessage } from "../message/mod.ts";
 
 export interface MessageFetcher {
@@ -25,15 +25,18 @@ export const createMessageFetcher = async (client: Client, chat: Chat) => {
 					messagesCount: limit,
 				},
 			});
+			if (!messages.length) {
+				return [];
+			}
 			const lastMessage = messages.at(-1)!;
+			// Message ids are 64-bit values far beyond Number.MAX_SAFE_INTEGER;
+			// parseInt silently rounds them and corrupts the pagination cursor.
 			lastMessageId = {
 				deliveredTime: lastMessage.deliveredTime,
-				messageId: parseInt(lastMessage.id),
+				messageId: BigInt(lastMessage.id),
 			};
 
-			return await Promise.all(
-				messages.map((message) => TalkMessage.fromRawTalk(message, client)),
-			);
+			return await Promise.all(messages.map((message) => TalkMessage.fromRawTalk(message, client)));
 		},
 	};
 };

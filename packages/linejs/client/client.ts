@@ -3,9 +3,17 @@ import { Square, SquareChat } from "./features/square/mod.ts";
 import { continueRequest } from "../base/mod.ts";
 import { Chat } from "./features/chat/mod.ts";
 import { User } from "./features/user/mod.ts";
+import { type BirthdayBoardClient, createBirthdayBoardClient } from "./features/birthday_board.ts";
+export * as birthdayBoard from "./features/birthday_board.ts";
+export type {
+	BirthdayBoardCardInput,
+	BirthdayBoardClient,
+	BirthdayBoardPageOptions,
+	BirthdayBoardRestResponse,
+} from "./features/birthday_board.ts";
 import { TypedEventEmitter } from "../base/core/typed-event-emitter/index.ts";
 import { SquareMessage, TalkMessage } from "./features/message/mod.ts";
-import type * as LINETypes from "@evex/linejs-types";
+import type * as LINETypes from "@evex-dev/linejs-types";
 import type {
 	CompactMessageResponse,
 	SendCompactMessageOptions,
@@ -70,6 +78,12 @@ export interface ListenOptions {
 }
 export type ClientEvents = {
 	message: (message: TalkMessage) => void;
+	/**
+	 * Fired when a talk message is edited.
+	 * The message keeps the id of the original message, so consumers can
+	 * replace their cached copy by id.
+	 */
+	"message:edit": (message: TalkMessage) => void;
 	event: (event: LINETypes.Operation) => void;
 	"square:message": (message: SquareMessage) => void;
 	"square:event": (event: LINETypes.SquareEvent) => void;
@@ -84,6 +98,7 @@ function isApiNotCapable(e: unknown): boolean {
 
 export class Client extends TypedEventEmitter<ClientEvents> {
 	readonly base: BaseClient;
+	#birthdayBoard?: BirthdayBoardClient;
 	#liff?: LiffClient;
 	constructor(base: BaseClient) {
 		super();
@@ -105,6 +120,14 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 		return this.#voom;
 	}
 
+	/** Birthday Board APIs backed by the LINE Android BDB endpoints. */
+	get birthdayBoard(): BirthdayBoardClient {
+		if (!this.#birthdayBoard) {
+			this.#birthdayBoard = createBirthdayBoardClient(this);
+		}
+		return this.#birthdayBoard;
+	}
+
 	#call?: CallClient;
 	/** Call control-plane wrapper (#148 v3.0). Media plane TBD. */
 	get call(): CallClient {
@@ -113,64 +136,92 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 	}
 
 	/**
-	 * Listens events.
+	 * Listens for events. Synchronous handler and decryption failures are logged
+	 * and skip that event; stream failures are logged and stop that stream.
+	 * Async event/log handlers must catch their own rejected promises.
 	 * @param opts Options
 	 * @returns TypedEventEmitter
 	 */
-	listen(
-		opts: ListenOptions = { talk: true, square: true },
-	): void {
+	listen(opts: ListenOptions = { talk: true, square: true }): void {
 		const polling = this.base.createPolling();
 		const signal = opts.signal;
-		signal && signal.addEventListener("abort", () => {
-			this.base.push.opStream.close();
-			this.base.push.sqStream.close();
-		});
+		signal &&
+			signal.addEventListener("abort", () => {
+				this.base.push.opStream.close();
+				this.base.push.sqStream.close();
+			});
+		// Nothing awaits the loops below, so a throw from the event stream, from
+		// decryptE2EEMessage or from one of the user's own listeners used to
+		// surface as an unhandled rejection and take the host process down.
+		// Catch per-event failures inside the loop, and terminal stream failures
+		// outside it. A bad message must not disable subsequent event delivery.
+		const reportListenFailure = (error: unknown) => {
+			try {
+				this.base.log("LegyPusherError", { error });
+			} catch {
+				// `log` fans out to user-supplied listeners. Letting one throw
+				// here would put back the unhandled rejection this handler
+				// exists to prevent.
+			}
+		};
 		if (opts.talk) {
 			(async () => {
-				for await (
-					const event of polling.listenTalkEvents()
-				) {
-					this.emit("event", event);
-					if (
-						event.type === "SEND_MESSAGE" ||
-						event.type === "RECEIVE_MESSAGE"
-					) {
-						this.emit(
-							"message",
-							new TalkMessage({
-								raw: await this.base.e2ee.decryptE2EEMessage(
-									event.message,
-								),
-								client: this,
-							}),
-						);
-					} else if (event.type === "NOTIFIED_RECEIVED_CALL") {
-						this.emit("call:incoming", parseIncomingCall(event));
-					} else if (event.type === "CANCEL_CALL") {
-						this.emit("call:cancel", parseCancelCall(event));
+				for await (const event of polling.listenTalkEvents()) {
+					try {
+						this.emit("event", event);
+						if (event.type === "SEND_MESSAGE" || event.type === "RECEIVE_MESSAGE") {
+							this.emit(
+								"message",
+								new TalkMessage({
+									raw: await this.base.e2ee.decryptE2EEMessage(event.message),
+									client: this,
+								}),
+							);
+						} else if (
+							// 159: someone else edited a message in a chat we are in.
+							event.type === "NOTIFIED_EDIT_MESSAGE" ||
+							// 158: we edited a message ourselves, synced from another
+							// device. Both are surfaced for the same reason
+							// SEND_MESSAGE and RECEIVE_MESSAGE both emit "message".
+							event.type === "EDIT_MESSAGE"
+						) {
+							this.emit(
+								"message:edit",
+								new TalkMessage({
+									raw: await this.base.e2ee.decryptE2EEMessage(event.message),
+									client: this,
+								}),
+							);
+						} else if (event.type === "NOTIFIED_RECEIVED_CALL") {
+							this.emit("call:incoming", parseIncomingCall(event, this.base.profile?.mid));
+						} else if (event.type === "CANCEL_CALL") {
+							this.emit("call:cancel", parseCancelCall(event));
+						}
+					} catch (error) {
+						reportListenFailure(error);
 					}
 				}
-			})();
+			})().catch(reportListenFailure);
 		}
 		if (opts.square) {
 			(async () => {
-				for await (
-					const event of polling.listenSquareEvents()
-				) {
-					this.emit("square:event", event);
-					if (event.type === "NOTIFICATION_MESSAGE") {
-						this.emit(
-							"square:message",
-							new SquareMessage({
-								raw: event.payload.notificationMessage
-									.squareMessage,
-								client: this,
-							}),
-						);
+				for await (const event of polling.listenSquareEvents()) {
+					try {
+						this.emit("square:event", event);
+						if (event.type === "NOTIFICATION_MESSAGE") {
+							this.emit(
+								"square:message",
+								new SquareMessage({
+									raw: event.payload.notificationMessage.squareMessage,
+									client: this,
+								}),
+							);
+						}
+					} catch (error) {
+						reportListenFailure(error);
 					}
 				}
-			})();
+			})().catch(reportListenFailure);
 		}
 	}
 
@@ -221,9 +272,7 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 	 * Uploads a new profile picture for the signed-in user (the avatar
 	 * shown in chats).  Returns the OBS object id + hash.
 	 */
-	uploadMyProfileImage(
-		data: Blob,
-	): Promise<{ objId: string; objHash: string }> {
+	uploadMyProfileImage(data: Blob): Promise<{ objId: string; objHash: string }> {
 		return uploadMyProfileImage(this, data);
 	}
 
@@ -231,9 +280,7 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 	 * Uploads a new profile background (the cover photo behind the
 	 * profile picture on the user's profile page).
 	 */
-	uploadMyProfileBackground(
-		data: Blob,
-	): Promise<{ objId: string; objHash: string }> {
+	uploadMyProfileBackground(data: Blob): Promise<{ objId: string; objHash: string }> {
 		return uploadMyProfileBackground(this, data);
 	}
 
@@ -259,27 +306,34 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 			request: { blockStatus: "ALL" },
 		});
 		if (!userFriendMids?.length) return [];
+		const batches: string[][] = [];
+		const batchSize = 100;
+		for (let i = 0; i < userFriendMids.length; i += batchSize) {
+			batches.push(userFriendMids.slice(i, i + batchSize));
+		}
 		try {
-			const res = await this.base.relation.getContactsV3({
-				mids: userFriendMids,
-			});
-			return res.responses.map((raw) => new User({ client: this, raw }));
+			const out: User[] = [];
+			for (const mids of batches) {
+				const res = await this.base.relation.getContactsV3({ mids });
+				out.push(...res.responses.map((raw) => new User({ client: this, raw })));
+			}
+			return out;
 		} catch (e) {
 			if (!isApiNotCapable(e)) throw e;
 		}
 		try {
-			const res2 = await this.base.talk.getContactsV2({
-				mids: userFriendMids,
-			});
-			// V2 returns { contacts: Record<mid, entry> }; shim to V3 shape.
 			const out: User[] = [];
-			for (const [mid, entry] of Object.entries(res2.contacts ?? {})) {
-				out.push(
-					new User({
-						client: this,
-						raw: { ...(entry as object), targetUserMid: mid } as never,
-					}),
-				);
+			for (const mids of batches) {
+				const res2 = await this.base.talk.getContactsV2({ mids });
+				// V2 returns { contacts: Record<mid, entry> }; shim to V3 shape.
+				for (const [mid, entry] of Object.entries(res2.contacts ?? {})) {
+					out.push(
+						new User({
+							client: this,
+							raw: { ...(entry as object), targetUserMid: mid } as never,
+						}),
+					);
+				}
 			}
 			if (out.length) return out;
 		} catch (e) {
@@ -289,7 +343,9 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 		for (const mid of userFriendMids) {
 			try {
 				out.push(await this.getUser(mid));
-			} catch { /* skip unreachable */ }
+			} catch {
+				/* skip unreachable */
+			}
 		}
 		return out;
 	}
@@ -313,9 +369,7 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 		});
 		const squareChats: SquareChat[] = [];
 		for (const event of response.events) {
-			if (
-				event.payload.notifiedCreateSquareChatMember
-			) {
+			if (event.payload.notifiedCreateSquareChatMember) {
 				squareChats.push(
 					new SquareChat({
 						client: this,
