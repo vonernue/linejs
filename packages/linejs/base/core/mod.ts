@@ -80,12 +80,11 @@ export interface ClientInit {
 	fetch?: FetchLike;
 
 	/**
-	 * LEGY encrypted gateway options.
+	 * LEGY gateway options. Talk requests use direct HTTPS by default.
+	 * Set `encrypted: true` to use the legacy encrypted gateway or `"auto"`
+	 * to select the legacy gateway based on the access token format.
 	 *
-	 * `auto` encrypts requests for modern JWT/primary/auth-key tokens while
-	 * keeping legacy opaque auth tokens on the normal endpoint.
-	 *
-	 * @default { encrypted: "auto" }
+	 * @default { encrypted: false }
 	 */
 	legy?: {
 		encrypted?: boolean | "auto";
@@ -187,7 +186,7 @@ export class BaseClient extends TypedEventEmitter<ClientEvents> {
 		};
 		this.device = init.device;
 		this.legy = {
-			encrypted: init.legy?.encrypted ?? "auto",
+			encrypted: init.legy?.encrypted ?? false,
 			endpoint: init.legy?.endpoint,
 			gatewayFailover: init.legy?.gatewayFailover ?? false,
 		};

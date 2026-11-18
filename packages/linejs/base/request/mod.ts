@@ -147,19 +147,22 @@ export class RequestClient {
 			Trequest.byteOffset,
 			Trequest.byteOffset + Trequest.byteLength,
 		);
+		const encrypted = this.shouldUseLegyEncryptedRequest(path, headers);
+		const directTalk = !encrypted && isLegyTalkPath(path);
 		const request = new Request(`https://${this.endpoint}${path}`, {
 			method: overrideMethod,
 			headers,
 			signal: AbortSignal.timeout(timeout),
 			body: new Uint8Array(requestArrayBuffer as ArrayBuffer),
+			redirect: directTalk ? "error" : "follow",
 		});
-		const response = this.shouldUseLegyEncryptedRequest(path, headers)
+		const response = encrypted
 			? await this.legyTransport.fetch(request, this.client.fetch, {
 					application: this.systemType,
 					userAgent: this.userAgent,
 					endpoint: this.client.legy.endpoint,
 				})
-			: await this.client.fetch(request);
+			: await (directTalk ? this.client.fetchPush(request) : this.client.fetch(request));
 		const nextToken = response.headers.get("x-line-next-access");
 		if (nextToken) {
 			this.client.emit("update:authtoken", nextToken);
